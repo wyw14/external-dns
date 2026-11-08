@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -128,6 +129,37 @@ func (df *DomainFilter) Match(domain string) bool {
 	return matchFilter(df.Filters, domain, true) && !matchFilter(df.exclude, domain, false)
 }
 
+// DomainRule explains the first DomainFilter rule that decided one domain.
+type DomainRule struct {
+	// Configured reports whether the filter holds any rule. A nil or empty
+	// filter admits every domain without evaluating a rule.
+	Configured bool
+	// Matched is the admission decision; it equals the result of Match.
+	Matched bool
+	// Negative marks an exclusion rule (exclude list or regex exclusion),
+	// so a rejection by exclusion is distinguishable from a rejection that
+	// merely matched no include rule.
+	Negative bool
+	// Text is a stable description of the deciding rule, or "" when the
+	// filter is not configured.
+	Text string
+	// Values lists the filter entries participating in the decision, sorted
+	// so reordering flag values never changes the explanation.
+	Values []string
+}
+
+// ExplainMatch mirrors Match without side effects, additionally reporting the
+// first rule that decided domain. It never consults the cluster or a provider.
+func (df *DomainFilter) ExplainMatch(domain string) DomainRule {
+	if df == nil || !df.IsConfigured() {
+		return DomainRule{Configured: false, Matched: true}
+	}
+	if (df.regex != nil && df.regex.String() != "") || (df.regexExclusion != nil && df.regexExclusion.String() != "") {
+		return explainRegexRule(df.regex, df.regexExclusion, domain)
+	}
+	return explainListRule(df.Filters, df.exclude, domain)
+}
+
 // matchFilter determines if any `filters` match `domain`.
 // If no `filters` are provided, behavior depends on `emptyval`
 // (empty `df.filters` matches everything, while empty `df.exclude` excludes nothing)
@@ -136,7 +168,15 @@ func matchFilter(filters []string, domain string, emptyval bool) bool {
 		return emptyval
 	}
 
+	return len(matchingEntries(filters, domain)) > 0
+}
+
+// matchingEntries returns every filter entry admitting domain under the
+// suffix/equality rules Match uses. Order follows the configured slice;
+// callers that need stable output sort the result.
+func matchingEntries(filters []string, domain string) []string {
 	strippedDomain := normalizeDomain(domain)
+	var matched []string
 	for _, filter := range filters {
 		if filter == "" {
 			continue
@@ -144,14 +184,110 @@ func matchFilter(filters []string, domain string, emptyval bool) bool {
 
 		switch {
 		case strings.HasPrefix(filter, ".") && strings.HasSuffix(strippedDomain, filter):
-			return true
+			matched = append(matched, filter)
 		case strings.Count(strippedDomain, ".") == strings.Count(filter, ".") && strippedDomain == filter:
-			return true
+			matched = append(matched, filter)
 		case strings.HasSuffix(strippedDomain, "."+filter):
-			return true
+			matched = append(matched, filter)
 		}
 	}
-	return false
+	return matched
+}
+
+// explainListRule explains a list-based DomainFilter, applying exclusions
+// before inclusions, matching Match's evaluation order.
+func explainListRule(include, exclude []string, domain string) DomainRule {
+	strippedDomain := normalizeDomain(domain)
+
+	if exclusions := matchingEntries(exclude, strippedDomain); len(exclusions) > 0 {
+		slices.Sort(exclusions)
+		return DomainRule{
+			Configured: true,
+			Matched:    false,
+			Negative:   true,
+			Text:       fmt.Sprintf("domain %q matched exclusion %q", strippedDomain, exclusions[0]),
+			Values:     exclusions,
+		}
+	}
+
+	if len(include) == 0 {
+		// Exclusion-only filter and nothing fired. Keep the negative-polarity
+		// entries visible so this is not mistaken for an unconfigured filter.
+		values := append([]string(nil), exclude...)
+		slices.Sort(values)
+		return DomainRule{
+			Configured: true,
+			Matched:    true,
+			Negative:   true,
+			Text:       fmt.Sprintf("domain %q matched no exclusion rule", strippedDomain),
+			Values:     values,
+		}
+	}
+
+	if inclusions := matchingEntries(include, strippedDomain); len(inclusions) > 0 {
+		slices.Sort(inclusions)
+		return DomainRule{
+			Configured: true,
+			Matched:    true,
+			Text:       fmt.Sprintf("domain %q matched inclusion %q", strippedDomain, inclusions[0]),
+			Values:     inclusions,
+		}
+	}
+
+	values := append([]string(nil), include...)
+	slices.Sort(values)
+	return DomainRule{
+		Configured: true,
+		Matched:    false,
+		Text:       fmt.Sprintf("domain %q matched no inclusion rule", strippedDomain),
+		Values:     values,
+	}
+}
+
+// explainRegexRule explains a regex-based DomainFilter, checking exclusion
+// before inclusion, matching matchRegex's evaluation order.
+func explainRegexRule(regex, negativeRegex *regexp.Regexp, domain string) DomainRule {
+	strippedDomain := normalizeDomain(domain)
+
+	if negativeRegex != nil && negativeRegex.String() != "" && negativeRegex.MatchString(strippedDomain) {
+		pattern := negativeRegex.String()
+		return DomainRule{
+			Configured: true,
+			Matched:    false,
+			Negative:   true,
+			Text:       fmt.Sprintf("domain %q matched regex exclusion %q", strippedDomain, pattern),
+			Values:     []string{pattern},
+		}
+	}
+
+	if regex != nil && regex.String() != "" {
+		pattern := regex.String()
+		if regex.MatchString(strippedDomain) {
+			return DomainRule{
+				Configured: true,
+				Matched:    true,
+				Text:       fmt.Sprintf("domain %q matched regex inclusion %q", strippedDomain, pattern),
+				Values:     []string{pattern},
+			}
+		}
+		return DomainRule{
+			Configured: true,
+			Matched:    false,
+			Text:       fmt.Sprintf("domain %q did not match regex inclusion %q", strippedDomain, pattern),
+			Values:     []string{pattern},
+		}
+	}
+
+	// Only a regex exclusion is configured and it did not match: the domain
+	// passes because the negative rule never fired.
+	pattern := negativeRegex.String()
+	return DomainRule{
+		Configured: true,
+		Matched:    true,
+		Negative:   true,
+		Text:       fmt.Sprintf("domain %q did not match regex exclusion %q", strippedDomain, pattern),
+		Values:     []string{pattern},
+	}
 }
 
 // matchRegex determines if a domain matches the configured regular expressions in DomainFilter.

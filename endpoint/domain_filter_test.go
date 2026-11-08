@@ -1375,3 +1375,111 @@ func TestRegexDomainFilterZoneNames(t *testing.T) {
 		})
 	}
 }
+
+func TestDomainFilterExplainMatch(t *testing.T) {
+	t.Run("nil receiver is not configured", func(t *testing.T) {
+		rule := (*DomainFilter)(nil).ExplainMatch("example.com")
+		assert.False(t, rule.Configured)
+		assert.True(t, rule.Matched)
+		assert.False(t, rule.Negative)
+		assert.Empty(t, rule.Text)
+	})
+
+	t.Run("zero-value filter is not configured", func(t *testing.T) {
+		rule := (&DomainFilter{}).ExplainMatch("example.com")
+		assert.False(t, rule.Configured)
+		assert.True(t, rule.Matched)
+		assert.Empty(t, rule.Text)
+	})
+
+	t.Run("include hit is a positive admission", func(t *testing.T) {
+		df := NewDomainFilter([]string{"example.com"})
+		rule := df.ExplainMatch("host.example.com")
+		assert.True(t, rule.Configured)
+		assert.True(t, rule.Matched)
+		assert.False(t, rule.Negative)
+		assert.Equal(t, []string{"example.com"}, rule.Values)
+		assert.Contains(t, rule.Text, "example.com")
+	})
+
+	t.Run("include miss is a positive rejection, not an exclusion", func(t *testing.T) {
+		df := NewDomainFilter([]string{"example.com"})
+		rule := df.ExplainMatch("example.org")
+		assert.True(t, rule.Configured)
+		assert.False(t, rule.Matched)
+		assert.False(t, rule.Negative)
+		assert.Equal(t, []string{"example.com"}, rule.Values)
+	})
+
+	t.Run("exclude hit is a negative rejection", func(t *testing.T) {
+		df := NewDomainFilterWithExclusions([]string{"example.com"}, []string{"api.example.com"})
+		rule := df.ExplainMatch("host.api.example.com")
+		assert.True(t, rule.Configured)
+		assert.False(t, rule.Matched)
+		assert.True(t, rule.Negative)
+		assert.Equal(t, []string{"api.example.com"}, rule.Values)
+	})
+
+	t.Run("exclude-only non-hit stays configured and admits", func(t *testing.T) {
+		df := NewDomainFilterWithExclusions(nil, []string{"api.example.com"})
+		rule := df.ExplainMatch("web.example.com")
+		assert.True(t, rule.Configured)
+		assert.True(t, rule.Matched)
+		assert.True(t, rule.Negative)
+		assert.Equal(t, []string{"api.example.com"}, rule.Values)
+	})
+
+	t.Run("regex exclusion wins over regex inclusion", func(t *testing.T) {
+		df := NewRegexDomainFilter(regexp.MustCompile(`.*\.example\.com`), regexp.MustCompile(`.*internal.*`))
+		rule := df.ExplainMatch("host.internal.example.com")
+		assert.True(t, rule.Configured)
+		assert.False(t, rule.Matched)
+		assert.True(t, rule.Negative)
+		assert.Contains(t, rule.Text, "regex exclusion")
+	})
+
+	t.Run("regex inclusion miss reports the include rule", func(t *testing.T) {
+		df := NewRegexDomainFilter(regexp.MustCompile(`^web\.`), nil)
+		rule := df.ExplainMatch("api.example.com")
+		assert.True(t, rule.Configured)
+		assert.False(t, rule.Matched)
+		assert.False(t, rule.Negative)
+	})
+
+	t.Run("matched entries are sorted regardless of configured order", func(t *testing.T) {
+		for _, include := range [][]string{
+			{"example.com", ".example.com"},
+			{".example.com", "example.com"},
+		} {
+			df := NewDomainFilter(include)
+			rule := df.ExplainMatch("host.example.com")
+			assert.True(t, rule.Matched)
+			assert.Equal(t, []string{".example.com", "example.com"}, rule.Values)
+			assert.Contains(t, rule.Text, ".example.com")
+		}
+	})
+}
+
+func TestDomainFilterExplainMatchAgreesWithMatch(t *testing.T) {
+	filters := []*DomainFilter{
+		nil,
+		NewDomainFilter(nil),
+		NewDomainFilter([]string{"example.com", ".example.org"}),
+		NewDomainFilterWithExclusions([]string{"example.com"}, []string{"api.example.com"}),
+		NewDomainFilterWithExclusions(nil, []string{"internal.example.com"}),
+		NewRegexDomainFilter(regexp.MustCompile(`.*\.example\.com`), nil),
+		NewRegexDomainFilter(regexp.MustCompile(`.*\.example\.com`), regexp.MustCompile(`.*internal.*`)),
+		NewRegexDomainFilter(nil, regexp.MustCompile(`.*internal.*`)),
+	}
+	domains := []string{
+		"example.com", "host.example.com", "api.example.com", "host.api.example.com",
+		"web.example.org", "internal.example.com", "host.internal.example.com", "example.net",
+	}
+
+	for i, df := range filters {
+		for _, domain := range domains {
+			rule := df.ExplainMatch(domain)
+			assert.Equal(t, df.Match(domain), rule.Matched, "filter %d domain %q", i, domain)
+		}
+	}
+}
